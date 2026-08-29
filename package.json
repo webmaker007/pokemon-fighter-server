@@ -1,0 +1,16 @@
+{
+  "name": "pokemon-fighter-server",
+  "version": "1.0.0",
+  "description": "Authoritative real-time match server for Pokemon Fighter online battles.",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "firebase-admin": "^12.6.0",
+    "ws": "^8.18.0"
+  }
+}
