@@ -574,7 +574,11 @@ function handleFaint(match, side, attackerSide) {
 
   let nextIndex = -1;
 
-  for (let i = f.teamIndex + 1; i < team.length; i++) {
+  for (let i = 0; i < team.length; i++) {
+    if (i === f.teamIndex) {
+      continue;
+    }
+
     if (team[i] && !team[i].fainted) {
       nextIndex = i;
       break;
