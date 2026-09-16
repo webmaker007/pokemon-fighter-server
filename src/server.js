@@ -143,6 +143,7 @@ wss.on("connection", async (ws, req) => {
   try {
     url = new URL(req.url, "http://localhost");
   } catch (e) {
+    console.error("[ws] bad request url:", req.url);
     ws.close(4000, "bad_request");
     return;
   }
@@ -151,6 +152,7 @@ wss.on("connection", async (ws, req) => {
   const roomId = url.searchParams.get("room");
 
   if (!token || !roomId) {
+    console.error("[ws] missing token or room on connect");
     ws.close(4001, "missing_token_or_room");
     return;
   }
@@ -160,11 +162,14 @@ wss.on("connection", async (ws, req) => {
   try {
     decoded = await admin.auth().verifyIdToken(token);
   } catch (e) {
+    console.error("[ws] token verification failed:", e.message);
     ws.close(4002, "invalid_token");
     return;
   }
 
   const uid = decoded.uid;
+
+  console.log("[ws] connected: uid=" + uid + " room=" + roomId);
 
   const room = getOrCreateRoom(roomId);
 
@@ -183,9 +188,15 @@ wss.on("connection", async (ws, req) => {
     room.uids.b = uid;
     room.sockets.b = ws;
   } else {
+    console.error(
+      "[ws] room full: room=" + roomId + " uid=" + uid +
+        " a=" + room.uids.a + " b=" + room.uids.b,
+    );
     ws.close(4003, "room_full");
     return;
   }
+
+  console.log("[ws] assigned side=" + side + " room=" + roomId);
 
   ws.side = side;
   ws.roomId = roomId;
@@ -237,6 +248,13 @@ function handleReady(room, ws, msg) {
   ws.team = sanitizeTeam(msg.team);
   ws.ready = true;
 
+  console.log(
+    "[ws] ready: room=" + room.roomId + " side=" + ws.side +
+      " incomingTeamLen=" +
+      (Array.isArray(msg.team) ? msg.team.length : "not-an-array:" + typeof msg.team) +
+      " sanitizedLen=" + ws.team.length,
+  );
+
   const otherWs = ws.side === "a" ? room.sockets.b : room.sockets.a;
 
   send(ws, { type: "waiting_for_opponent" });
@@ -275,8 +293,25 @@ function sanitizeTeam(team) {
 
   return team.slice(0, 6).map((p) => ({
     name: String((p && p.name) || "unknown").slice(0, 40),
+    id: clampNumber(p && p.id, 1, 100000, 0) || undefined,
+    height: clampNumber(p && p.height, 0, 1000, undefined),
+    types: sanitizeTypes(p && p.types),
     hp: battleSim.GAME.maxHP,
     move: sanitizeMove(p && p.move),
+  }));
+}
+
+function sanitizeTypes(types) {
+  if (!Array.isArray(types)) {
+    return undefined;
+  }
+
+  /* Cosmetic only (which sprite/name shows on the opponent's
+     screen) — not used by the authoritative simulation at all, so
+     this only needs to be well-formed enough not to break
+     rendering, not airtight against a tampered value. */
+  return types.slice(0, 4).map((t) => ({
+    type: { name: String((t && t.type && t.type.name) || "normal").slice(0, 20) },
   }));
 }
 
@@ -305,9 +340,27 @@ function clampNumber(value, min, max, fallback) {
 }
 
 function startMatch(room) {
+  console.log(
+    "[ws] starting match: room=" + room.roomId +
+      " teamA.len=" + room.sockets.a.team.length +
+      " teamB.len=" + room.sockets.b.team.length,
+  );
+
   room.match = battleSim.createMatch(room.sockets.a.team, room.sockets.b.team);
 
-  broadcast(room, { type: "start" });
+  send(room.sockets.a, {
+    type: "start",
+    myTeam: room.sockets.a.team,
+    opponentTeam: room.sockets.b.team,
+  });
+
+  send(room.sockets.b, {
+    type: "start",
+    myTeam: room.sockets.b.team,
+    opponentTeam: room.sockets.a.team,
+  });
+
+  console.log("[ws] \"start\" sent to both sides: room=" + room.roomId);
 
   room.lastTick = Date.now();
 
