@@ -143,7 +143,6 @@ wss.on("connection", async (ws, req) => {
   try {
     url = new URL(req.url, "http://localhost");
   } catch (e) {
-    console.error("[ws] bad request url:", req.url);
     ws.close(4000, "bad_request");
     return;
   }
@@ -152,7 +151,6 @@ wss.on("connection", async (ws, req) => {
   const roomId = url.searchParams.get("room");
 
   if (!token || !roomId) {
-    console.error("[ws] missing token or room on connect");
     ws.close(4001, "missing_token_or_room");
     return;
   }
@@ -162,14 +160,11 @@ wss.on("connection", async (ws, req) => {
   try {
     decoded = await admin.auth().verifyIdToken(token);
   } catch (e) {
-    console.error("[ws] token verification failed:", e.message);
     ws.close(4002, "invalid_token");
     return;
   }
 
   const uid = decoded.uid;
-
-  console.log("[ws] connected: uid=" + uid + " room=" + roomId);
 
   const room = getOrCreateRoom(roomId);
 
@@ -188,15 +183,9 @@ wss.on("connection", async (ws, req) => {
     room.uids.b = uid;
     room.sockets.b = ws;
   } else {
-    console.error(
-      "[ws] room full: room=" + roomId + " uid=" + uid +
-        " a=" + room.uids.a + " b=" + room.uids.b,
-    );
     ws.close(4003, "room_full");
     return;
   }
-
-  console.log("[ws] assigned side=" + side + " room=" + roomId);
 
   ws.side = side;
   ws.roomId = roomId;
@@ -247,13 +236,6 @@ function handleMessage(room, ws, raw) {
 function handleReady(room, ws, msg) {
   ws.team = sanitizeTeam(msg.team);
   ws.ready = true;
-
-  console.log(
-    "[ws] ready: room=" + room.roomId + " side=" + ws.side +
-      " incomingTeamLen=" +
-      (Array.isArray(msg.team) ? msg.team.length : "not-an-array:" + typeof msg.team) +
-      " sanitizedLen=" + ws.team.length,
-  );
 
   const otherWs = ws.side === "a" ? room.sockets.b : room.sockets.a;
 
@@ -340,12 +322,6 @@ function clampNumber(value, min, max, fallback) {
 }
 
 function startMatch(room) {
-  console.log(
-    "[ws] starting match: room=" + room.roomId +
-      " teamA.len=" + room.sockets.a.team.length +
-      " teamB.len=" + room.sockets.b.team.length,
-  );
-
   room.match = battleSim.createMatch(room.sockets.a.team, room.sockets.b.team);
 
   send(room.sockets.a, {
@@ -359,8 +335,6 @@ function startMatch(room) {
     myTeam: room.sockets.b.team,
     opponentTeam: room.sockets.a.team,
   });
-
-  console.log("[ws] \"start\" sent to both sides: room=" + room.roomId);
 
   room.lastTick = Date.now();
 
