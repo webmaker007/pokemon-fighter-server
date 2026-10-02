@@ -59,6 +59,7 @@ instance (~$7/month range) keeps it running all the time.
   job on the client side, which is a separate piece of work. This
   server just needs a `roomId` and pairs up the first two players
   who show up with the same one.
+- (Updated) Wagers: the server now agrees the stake, takes both stakes at match start and pays the winner by writing entries to `walletAdjustments/{uid}/entries/*`; stale "active" wagers are refunded on boot. Needs the matching `firestore.rules` from the client project.
 - It doesn't decide coin/rank rewards for winning — it only records
   *who legitimately won* to a `matches` collection in Firestore, so
   a tampered client can't lie about the outcome. Hooking that up to
