@@ -81,6 +81,162 @@ const TICK_MS = 1000 / TICK_HZ;
 
 const DISCONNECT_FORFEIT_MS = 20000;
 
+/* ------------------------------------------------------------
+   WAGERS
+
+   The server — not either client — decides what the stake is and
+   who gets paid. Both players must send the SAME allowed bet in
+   their "ready" message or the match is cancelled. Stakes are
+   taken at match start and the pot is paid at the end by writing
+   "wallet adjustment" entries (walletAdjustments/{uid}/entries/{id})
+   with firebase-admin. Clients can only READ and delete their own
+   entries (see firestore.rules), so they can't forge winnings.
+   Entry ids are deterministic per match, so a retry can never pay
+   twice (create() fails if the id already exists).
+------------------------------------------------------------ */
+
+const ALLOWED_BETS = [
+  { amount: 50, currency: "coins" },
+  { amount: 150, currency: "coins" },
+  { amount: 5, currency: "gems" },
+  { amount: 15, currency: "gems" },
+];
+
+function sanitizeBet(bet) {
+  const amount = Number(bet && bet.amount);
+  const currency = bet && bet.currency === "gems" ? "gems" : "coins";
+
+  const ok = ALLOWED_BETS.some(
+    (b) => b.amount === amount && b.currency === currency,
+  );
+
+  return ok ? { amount, currency } : { amount: 0, currency: "coins" };
+}
+
+function adjustmentRef(uid, entryId) {
+  return db
+    .collection("walletAdjustments")
+    .doc(uid)
+    .collection("entries")
+    .doc(entryId);
+}
+
+function writeAdjustment(batch, uid, entryId, bet, sign, reason, matchId) {
+  batch.create(adjustmentRef(uid, entryId), {
+    currency: bet.currency,
+    delta: sign * bet.amount,
+    reason: reason,
+    matchId: matchId,
+    createdAt: admin.firestore.FieldValue.serverTimestamp(),
+  });
+}
+
+/* Best-effort affordability check against each player's cloud save
+   (players/{uid}). A missing/non-numeric balance counts as 0. */
+async function canBothAfford(uidA, uidB, bet) {
+  const field = bet.currency === "gems" ? "gems" : "coins";
+
+  const [snapA, snapB] = await Promise.all([
+    db.collection("players").doc(uidA).get(),
+    db.collection("players").doc(uidB).get(),
+  ]);
+
+  /* A player whose save hasn't synced to the cloud yet has no
+     numeric balance on record — don't block them (their device still
+     checks its own balance). Only block a KNOWN balance that is too
+     low. */
+  const enough = (snap) => {
+    const v = snap.exists ? snap.data()[field] : undefined;
+    return typeof v !== "number" || v >= bet.amount;
+  };
+
+  return enough(snapA) && enough(snapB);
+}
+
+/* Takes both stakes (as negative entries) and records an "active"
+   wager so a server restart mid-match can refund it (see
+   refundStaleWagers). Returns false if the stake couldn't be taken. */
+async function takeStakes(room) {
+  const bet = room.bet;
+
+  if (!bet || !bet.amount) return true;
+
+  try {
+    const batch = db.batch();
+
+    writeAdjustment(batch, room.uids.a, room.matchId + "_stake", bet, -1, "wager_stake", room.matchId);
+    writeAdjustment(batch, room.uids.b, room.matchId + "_stake", bet, -1, "wager_stake", room.matchId);
+
+    batch.create(db.collection("wagers").doc(room.matchId), {
+      players: [room.uids.a, room.uids.b],
+      amount: bet.amount,
+      currency: bet.currency,
+      status: "active",
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    await batch.commit();
+
+    return true;
+  } catch (e) {
+    console.error("[wager] failed to take stakes:", e.message);
+    return false;
+  }
+}
+
+/* Pays the pot (2x stake) to the winner and closes the wager. */
+async function payOutWager(room, winnerUid) {
+  const bet = room.bet;
+
+  if (!bet || !bet.amount || !room.matchId) return;
+
+  try {
+    const batch = db.batch();
+
+    writeAdjustment(batch, winnerUid, room.matchId + "_payout", { amount: bet.amount * 2, currency: bet.currency }, 1, "wager_win", room.matchId);
+
+    batch.update(db.collection("wagers").doc(room.matchId), {
+      status: "settled",
+      winnerUid: winnerUid,
+      settledAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    await batch.commit();
+  } catch (e) {
+    console.error("[wager] failed to pay out:", e.message);
+  }
+}
+
+/* On boot: any wager still "active" belongs to a match this process
+   never finished (Render restarted/spun down mid-match). Refund both
+   stakes so nobody loses currency to a crash. */
+async function refundStaleWagers() {
+  try {
+    const snap = await db.collection("wagers").where("status", "==", "active").get();
+
+    for (const doc of snap.docs) {
+      const w = doc.data();
+      const bet = { amount: w.amount, currency: w.currency };
+      const batch = db.batch();
+
+      for (const uid of w.players || []) {
+        writeAdjustment(batch, uid, doc.id + "_refund", bet, 1, "wager_refund", doc.id);
+      }
+
+      batch.update(doc.ref, {
+        status: "refunded",
+        settledAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+
+      await batch.commit();
+
+      console.log("[wager] refunded stale wager " + doc.id);
+    }
+  } catch (e) {
+    console.error("[wager] stale refund failed:", e.message);
+  }
+}
+
 const httpServer = http.createServer((req, res) => {
   res.writeHead(200, { "Content-Type": "text/plain" });
   res.end("Pokemon Fighter match server is running.\n");
@@ -143,6 +299,7 @@ wss.on("connection", async (ws, req) => {
   try {
     url = new URL(req.url, "http://localhost");
   } catch (e) {
+    console.error("[ws] bad request url:", req.url);
     ws.close(4000, "bad_request");
     return;
   }
@@ -151,6 +308,7 @@ wss.on("connection", async (ws, req) => {
   const roomId = url.searchParams.get("room");
 
   if (!token || !roomId) {
+    console.error("[ws] missing token or room on connect");
     ws.close(4001, "missing_token_or_room");
     return;
   }
@@ -160,11 +318,14 @@ wss.on("connection", async (ws, req) => {
   try {
     decoded = await admin.auth().verifyIdToken(token);
   } catch (e) {
+    console.error("[ws] token verification failed:", e.message);
     ws.close(4002, "invalid_token");
     return;
   }
 
   const uid = decoded.uid;
+
+  console.log("[ws] connected: uid=" + uid + " room=" + roomId);
 
   const room = getOrCreateRoom(roomId);
 
@@ -183,9 +344,15 @@ wss.on("connection", async (ws, req) => {
     room.uids.b = uid;
     room.sockets.b = ws;
   } else {
+    console.error(
+      "[ws] room full: room=" + roomId + " uid=" + uid +
+        " a=" + room.uids.a + " b=" + room.uids.b,
+    );
     ws.close(4003, "room_full");
     return;
   }
+
+  console.log("[ws] assigned side=" + side + " room=" + roomId);
 
   ws.side = side;
   ws.roomId = roomId;
@@ -235,7 +402,15 @@ function handleMessage(room, ws, raw) {
    starts once both are in. */
 function handleReady(room, ws, msg) {
   ws.team = sanitizeTeam(msg.team);
+  ws.bet = sanitizeBet(msg.bet);
   ws.ready = true;
+
+  console.log(
+    "[ws] ready: room=" + room.roomId + " side=" + ws.side +
+      " incomingTeamLen=" +
+      (Array.isArray(msg.team) ? msg.team.length : "not-an-array:" + typeof msg.team) +
+      " sanitizedLen=" + ws.team.length,
+  );
 
   const otherWs = ws.side === "a" ? room.sockets.b : room.sockets.a;
 
@@ -246,7 +421,8 @@ function handleReady(room, ws, msg) {
     room.sockets.b &&
     room.sockets.a.ready &&
     room.sockets.b.ready &&
-    !room.match
+    !room.match &&
+    !room.starting
   ) {
     startMatch(room);
   } else if (otherWs) {
@@ -321,24 +497,118 @@ function clampNumber(value, min, max, fallback) {
   return Math.max(min, Math.min(max, n));
 }
 
-function startMatch(room) {
+async function startMatch(room) {
+  /* Lock the room so a second "ready" can't start it twice while
+     the async wager checks below are running. */
+  room.starting = true;
+
+  const betA = room.sockets.a.bet || { amount: 0, currency: "coins" };
+  const betB = room.sockets.b.bet || { amount: 0, currency: "coins" };
+
+  if (betA.amount !== betB.amount || betA.currency !== betB.currency) {
+    cancelMatch(room, "bet_mismatch");
+    return;
+  }
+
+  room.bet = betA;
+  room.matchId = room.roomId + "_" + Date.now();
+
+  if (room.bet.amount) {
+    let affordable = false;
+
+    try {
+      affordable = await canBothAfford(room.uids.a, room.uids.b, room.bet);
+    } catch (e) {
+      console.error("[wager] balance check failed:", e.message);
+    }
+
+    if (!affordable) {
+      cancelMatch(room, "cannot_afford");
+      return;
+    }
+
+    if (!(await takeStakes(room))) {
+      cancelMatch(room, "wager_failed");
+      return;
+    }
+  }
+
+  /* A player may have left while the checks ran. */
+  if (!room.sockets.a || !room.sockets.b) {
+    if (room.bet && room.bet.amount) {
+      await refundRoomWager(room);
+    }
+
+    cancelMatch(room, "opponent_left");
+    return;
+  }
+
+  console.log(
+    "[ws] starting match: room=" + room.roomId +
+      " teamA.len=" + room.sockets.a.team.length +
+      " teamB.len=" + room.sockets.b.team.length,
+  );
+
   room.match = battleSim.createMatch(room.sockets.a.team, room.sockets.b.team);
 
   send(room.sockets.a, {
     type: "start",
     myTeam: room.sockets.a.team,
     opponentTeam: room.sockets.b.team,
+    bet: room.bet,
   });
 
   send(room.sockets.b, {
     type: "start",
     myTeam: room.sockets.b.team,
     opponentTeam: room.sockets.a.team,
+    bet: room.bet,
   });
+
+  console.log("[ws] \"start\" sent to both sides: room=" + room.roomId);
 
   room.lastTick = Date.now();
 
   room.timer = setInterval(() => tickRoom(room), TICK_MS);
+}
+
+function cancelMatch(room, reason) {
+  console.log("[ws] match cancelled: room=" + room.roomId + " reason=" + reason);
+
+  broadcast(room, { type: "match_cancelled", reason: reason });
+
+  if (room.timer) clearInterval(room.timer);
+
+  rooms.delete(room.roomId);
+
+  [room.sockets.a, room.sockets.b].forEach((sock) => {
+    if (sock) {
+      try {
+        sock.close(1000, reason);
+      } catch (e) {
+        /* Already closed. */
+      }
+    }
+  });
+}
+
+/* Gives both stakes back when a match never actually began. */
+async function refundRoomWager(room) {
+  try {
+    const batch = db.batch();
+
+    writeAdjustment(batch, room.uids.a, room.matchId + "_refund", room.bet, 1, "wager_refund", room.matchId);
+    writeAdjustment(batch, room.uids.b, room.matchId + "_refund", room.bet, 1, "wager_refund", room.matchId);
+
+    batch.update(db.collection("wagers").doc(room.matchId), {
+      status: "refunded",
+      settledAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    await batch.commit();
+  } catch (e) {
+    console.error("[wager] refund failed:", e.message);
+  }
 }
 
 function tickRoom(room) {
@@ -366,6 +636,14 @@ function tickRoom(room) {
 }
 
 async function endMatch(room, winnerUid, reason) {
+  /* Guard: a KO and a forfeit timer (or a duplicate tick) must never
+     settle the same match twice. */
+  if (room.settled) {
+    return;
+  }
+
+  room.settled = true;
+
   if (room.timer) {
     clearInterval(room.timer);
     room.timer = null;
@@ -377,7 +655,10 @@ async function endMatch(room, winnerUid, reason) {
     type: "match_over",
     winnerUid: winnerUid,
     reason: reason || "ko",
+    bet: room.bet || null,
   });
+
+  await payOutWager(room, winnerUid);
 
   /* Record the result server-side (bypasses Firestore rules via
      firebase-admin) so a tampered client can't fabricate a win.
@@ -392,6 +673,7 @@ async function endMatch(room, winnerUid, reason) {
       winnerUid: winnerUid,
       loserUid: loserUid,
       reason: reason || "ko",
+      bet: room.bet || null,
       endedAt: admin.firestore.FieldValue.serverTimestamp(),
     });
   } catch (e) {
@@ -436,6 +718,8 @@ function clearDisconnectTimer(room, side) {
     room.disconnectTimers[side] = null;
   }
 }
+
+refundStaleWagers();
 
 httpServer.listen(PORT, () => {
   console.log(`[server] listening on port ${PORT}`);
