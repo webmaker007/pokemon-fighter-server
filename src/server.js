@@ -285,8 +285,14 @@ function send(ws, payload) {
 }
 
 function broadcast(room, payload) {
-  send(room.sockets.a, payload);
-  send(room.sockets.b, payload);
+  /* Serialize once, send to both players (this runs 30x/sec). */
+  const text = JSON.stringify(payload);
+
+  [room.sockets.a, room.sockets.b].forEach((ws) => {
+    if (ws && ws.readyState === ws.OPEN) {
+      ws.send(text);
+    }
+  });
 }
 
 /* ------------------------------------------------------------
@@ -372,6 +378,11 @@ function handleMessage(room, ws, raw) {
   try {
     msg = JSON.parse(raw.toString());
   } catch (e) {
+    return;
+  }
+
+  if (msg.type === "ping") {
+    send(ws, { type: "pong", t: msg.t });
     return;
   }
 
