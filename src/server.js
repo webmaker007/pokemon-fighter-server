@@ -441,6 +441,62 @@ function handleReady(room, ws, msg) {
   }
 }
 
+/* ------------------------------------------------------------
+   AUTHORITATIVE POKÉMON TYPES
+
+   Type effectiveness needs each Pokémon's real types. Look them up
+   from PokéAPI by id (cached), so a modified client can't claim e.g.
+   a Ghost type to dodge Normal hits. If the lookup fails or times
+   out, the match falls back to the types the client reported.
+------------------------------------------------------------ */
+
+const typeCache = new Map();
+
+async function fetchTypesFor(id) {
+  if (!id) return null;
+
+  if (typeCache.has(id)) return typeCache.get(id);
+
+  try {
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), 3000);
+
+    const res = await fetch("https://pokeapi.co/api/v2/pokemon/" + id, {
+      signal: ctl.signal,
+    });
+
+    clearTimeout(timer);
+
+    if (!res.ok) return null;
+
+    const data = await res.json();
+
+    const types = (data.types || [])
+      .map((t) => t && t.type && t.type.name)
+      .filter((t) => typeof t === "string");
+
+    if (types.length) {
+      typeCache.set(id, types);
+
+      return types;
+    }
+  } catch (e) {
+    /* Fall back to client-reported types. */
+  }
+
+  return null;
+}
+
+async function attachAuthoritativeTypes(team) {
+  await Promise.all(
+    team.map(async (p) => {
+      const types = await fetchTypesFor(p.id);
+
+      if (types) p.simTypes = types;
+    }),
+  );
+}
+
 function sanitizeTeam(team) {
   if (!Array.isArray(team) || !team.length) {
     return [
@@ -559,6 +615,19 @@ async function startMatch(room) {
       " teamA.len=" + room.sockets.a.team.length +
       " teamB.len=" + room.sockets.b.team.length,
   );
+
+  await attachAuthoritativeTypes(room.sockets.a.team);
+  await attachAuthoritativeTypes(room.sockets.b.team);
+
+  /* A player may have left while the type lookups ran. */
+  if (!room.sockets.a || !room.sockets.b) {
+    if (room.bet && room.bet.amount) {
+      await refundRoomWager(room);
+    }
+
+    cancelMatch(room, "opponent_left");
+    return;
+  }
 
   room.match = battleSim.createMatch(room.sockets.a.team, room.sockets.b.team);
 
