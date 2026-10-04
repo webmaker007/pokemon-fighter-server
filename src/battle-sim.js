@@ -43,6 +43,26 @@ const GAME = {
   maxProjectiles: 10,
 };
 
+const rules = require("./rules");
+
+/* Type names for the Pokémon a side currently has out. The server
+   fills p.simTypes from PokéAPI at match start (so a tampered client
+   can't claim a favourable type); if that lookup failed it falls
+   back to the types the client sent. */
+function typesOf(p) {
+  if (!p) return [];
+
+  if (Array.isArray(p.simTypes) && p.simTypes.length) return p.simTypes;
+
+  return (p.types || [])
+    .map((t) => t && t.type && t.type.name)
+    .filter((t) => typeof t === "string");
+}
+
+function activePokemon(match, side) {
+  return match.teams[side][match.fighters[side].teamIndex];
+}
+
 function clamp(value, min, max) {
   return Math.max(min, Math.min(max, value));
 }
@@ -130,6 +150,8 @@ function createMatch(teamA, teamB) {
     winner: null,
     ended: false,
 
+    events: [],
+
     tick: 0,
   };
 }
@@ -198,6 +220,10 @@ function step(match, dt) {
   }
 
   match.tick += 1;
+
+  /* Per-tick hit events (damage numbers, "super effective!", …) for
+     the clients to show — rebuilt every tick. */
+  match.events = [];
 
   processPendingActions(match, "a");
   processPendingActions(match, "b");
@@ -543,11 +569,45 @@ function hitTarget(match, attackerSide, targetSide, move) {
     return;
   }
 
-  let damage = move.damage || 15;
+  const attackerPokemon = activePokemon(match, attackerSide);
+  const defenderPokemon = activePokemon(match, targetSide);
 
-  if (target.blocking) {
+  /* Same rules as the local/CPU battle: type effectiveness first… */
+  const effectiveness = rules.typeEffectivenessMultiplier(
+    move.type,
+    typesOf(defenderPokemon),
+  );
+
+  /* …an immune target takes nothing (no knockback, flash or combo). */
+  if (effectiveness === 0) {
+    match.events.push({ target: targetSide, damage: 0, eff: 0, blocked: false });
+
+    return;
+  }
+
+  let damage = Math.max(1, Math.round((move.damage || 15) * effectiveness));
+
+  /* …then the Legendary/Mythical bonuses (hit harder, take less). */
+  if (rules.isLegendaryPokemon(attackerPokemon)) {
+    damage = Math.round(damage * rules.LEGENDARY_DAMAGE_DEALT_MULT);
+  }
+
+  if (rules.isLegendaryPokemon(defenderPokemon)) {
+    damage = Math.max(1, Math.round(damage * rules.LEGENDARY_DAMAGE_TAKEN_MULT));
+  }
+
+  const blocked = !!target.blocking;
+
+  if (blocked) {
     damage = Math.max(3, Math.round(damage * 0.25));
   }
+
+  match.events.push({
+    target: targetSide,
+    damage: damage,
+    eff: effectiveness,
+    blocked: blocked,
+  });
 
   target.hp = clamp(target.hp - damage, 0, GAME.maxHP);
   target.hitTimer = target.blocking ? 90 : 180;
@@ -610,6 +670,7 @@ function handleFaint(match, side, attackerSide) {
 function snapshot(match) {
   return {
     tick: match.tick,
+    events: match.events || [],
     ended: match.ended,
     winner: match.winner,
     fighters: {
