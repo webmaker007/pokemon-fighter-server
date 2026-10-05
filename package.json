@@ -4,7 +4,8 @@
   "description": "Authoritative real-time match server for Pokemon Fighter online battles.",
   "main": "src/server.js",
   "scripts": {
-    "start": "node src/server.js"
+    "start": "node src/server.js",
+    "test": "node --test"
   },
   "engines": {
     "node": ">=18"
