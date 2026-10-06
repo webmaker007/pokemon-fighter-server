@@ -521,6 +521,13 @@ async function attachAuthoritativeTypes(team) {
   );
 }
 
+const BALL_IDS = new Set([
+  "pokeball", "great", "ultra", "master", "premier", "luxury", "heal",
+  "quick", "timer", "repeat", "nest", "net", "dive", "lure", "dusk",
+  "level", "moon", "friend", "love", "heavy", "fast", "dream", "sport",
+  "safari", "park", "cherish", "beast",
+]);
+
 function sanitizeTeam(team) {
   if (!Array.isArray(team) || !team.length) {
     return [
@@ -547,6 +554,9 @@ function sanitizeTeam(team) {
     types: sanitizeTypes(p && p.types),
     hp: battleSim.GAME.maxHP,
     move: sanitizeMove(p && p.move),
+    /* Cosmetic: which Poké Ball it was caught in, so the opponent
+       sees it sent out of the right ball. Unknown ids are dropped. */
+    ball: BALL_IDS.has(p && p.ball) ? p.ball : undefined,
   }));
 }
 
